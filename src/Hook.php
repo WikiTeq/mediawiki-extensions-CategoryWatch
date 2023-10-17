@@ -23,21 +23,21 @@ namespace CategoryWatch;
 
 use Category;
 use EchoEvent;
+use ExtensionRegistry;
 use MediaWiki\MediaWikiServices;
+use MediaWiki\Page\PageIdentity;
 use Title;
 use User;
-use WatchedItemStore;
 use WikiPage;
 
 class Hook {
 	/**
 	 * Explain bundling
 	 *
-	 * @param Event $event to bundle
+	 * @param EchoEvent $event to bundle
 	 * @param string &$bundleString to use
 	 */
 	public static function onEchoGetBundleRules( EchoEvent $event, &$bundleString ) {
-		wfDebugLog( 'CategoryWatch', __METHOD__ );
 		switch ( $event->getType() ) {
 			case 'categorywatch-add':
 			case 'categorywatch-remove':
@@ -57,7 +57,6 @@ class Hook {
 	public static function onBeforeCreateEchoEvent(
 		array &$notifications, array &$notificationCategories, array &$icons
 	) {
-		wfDebugLog( 'CategoryWatch', __METHOD__ );
 		$icons['categorywatch']['path'] = 'CategoryWatch/assets/catwatch.svg';
 
 		$notifications['categorywatch-add'] = [
@@ -95,19 +94,6 @@ class Hook {
 	}
 
 	/**
-	 * Internal compatibility function
-	 * @return WatchedItemStore
-	 */
-	private static function getWatchedItemStore() {
-		wfDebugLog( 'CategoryWatch', __METHOD__ );
-		if ( method_exists( 'WatchedItemStore', 'getDefaultInstance' ) ) {
-			return WatchedItemStore::getDefaultInstance();
-		} else {
-			return MediaWikiServices::getInstance()->getWatchedItemStore();
-		}
-	}
-
-	/**
 	 * Hook for page being added to a category.
 	 *
 	 * @param Category $cat that page is being add to
@@ -116,41 +102,30 @@ class Hook {
 	public static function onCategoryAfterPageAdded(
 		Category $cat, WikiPage $page
 	) {
-		wfDebugLog( 'CategoryWatch', __METHOD__ );
+		$mwServices = MediaWikiServices::getInstance();
+		$store = $mwServices->getWatchedItemStore();
+		$catPage = $cat->getPage();
 
-		$store = self::getWatchedItemStore();
+		if ( !$store->countWatchers( $catPage ) ) {
+			# Nobody watches the category
+			return;
+		}
 
-		# Is anyone watching the category?
-		if ( $store->countWatchers( $cat->getTitle() ) > 0 ) {
-			# Send them a notification!
-			$user = User::newFromId( $page->getUser() );
-
+		if ( ExtensionRegistry::getInstance()->getAllThings()['Echo'] ?? false ) {
+			$revisionLockup = $mwServices->getRevisionLookup();
+			$revision = $revisionLockup->getRevisionByTitle( $page );
+			$revId = $revision ? $revision->getId() : null;
+			# Send a notification!
 			EchoEvent::create( [
 				'type' => 'categorywatch-add',
-				'title' => $cat->getTitle(),
-				'agent' => $user,
+				'title' => Title::castFromPageIdentity( $cat->getPage() ),
+				'agent' => $revision->getUser(),
 				'extra' => [
 					'pageid' => $page->getId(),
-					'revid' => $page->getRevision()->getId(),
+					'revid' => $revId,
 				],
 			] );
 		}
-		$watchers = [];
-		foreach ( self::getWatchers( $cat->getTitle() ) as $watcher ) {
-			if ( method_exists( MediaWikiServices::class, 'getUserOptionsLookup' ) ) {
-				// MediaWiki 1.35+
-				if ( MediaWikiServices::getInstance()->getUserOptionsLookup()
-					->getOption( $watcher, 'catwatch-watch-pages' )
-				) {
-					$watchers[] = $watcher;
-				}
-			} else {
-				if ( $watcher->getOption( 'catwatch-watch-pages' ) ) {
-					$watchers[] = $watcher;
-				}
-			}
-		}
-		self::addUserBatchForWatch( $watchers, $cat->getTitle() );
 	}
 
 	/**
@@ -170,50 +145,6 @@ class Hook {
 	}
 
 	/**
-	 * Mirror of WatchedItemStore::addWatchBatchForUser
-	 *
-	 * @param array $watchers list of users
-	 * @param Title $target title to add them to
-	 * @return bool
-	 */
-	private static function addUserBatchForWatch( array $watchers, Title $target ) {
-		if ( MediaWikiServices::getInstance()->getReadOnlyMode()->isReadOnly() ) {
-			return false;
-		}
-
-		if ( !$watchers ) {
-			return true;
-		}
-
-		$rows = [];
-		foreach ( $watchers as $user ) {
-			$rows[] = [
-				'wl_user' => $user->getId(),
-				'wl_namespace' => $target->getNamespace(),
-				'wl_title' => $target->getDBkey(),
-				'wl_notificationtimestamp' => null,
-			];
-			// WatchedItemStore instantiates a WatchedItem instance
-			// with the HashBagOStuff here, but it shouldn't be needed
-			// on small non-farm wikis. See
-			// https://gerrit.wikimedia.org/r/#/c/319255/2/includes/WatchedItemStore.php
-		}
-
-		$dbw = wfGetDB( DB_MASTER );
-		foreach ( array_chunk( $rows, 100 ) as $toInsert ) {
-			// Use INSERT IGNORE to avoid overwriting the notification timestamp
-			// if there's already an entry for this page
-			$dbw->insert( 'watchlist', $toInsert, __METHOD__, 'IGNORE' );
-		}
-		// WatchedItemStore instantiates a WatchedItem instance with
-		// the HashBagOStuff here, but it shouldn't be needed on small
-		// non-farm wikis.
-		// https://gerrit.wikimedia.org/r/#/c/319255/2/includes/WatchedItemStore.php
-
-		return true;
-	}
-
-	/**
 	 * Hook for page being taken out of a category.
 	 *
 	 * @param Category $cat that page is being removed from
@@ -225,27 +156,27 @@ class Hook {
 	public static function onCategoryAfterPageRemoved(
 		Category $cat, WikiPage $page, $pageID = 0
 	) {
-		wfDebugLog( 'CategoryWatch', __METHOD__ );
-		# Is anyone watching the category?
-		if (
-			self::getWatchedItemStore()
-			->countWatchers( $cat->getTitle() ) > 0
-		) {
-			# Send them a notification!
-			$user = User::newFromId( $page->getUser() );
+		$mwServices = MediaWikiServices::getInstance();
+		$store = $mwServices->getWatchedItemStore();
+		$catPage = $cat->getPage();
 
-			$revId = null;
-			$rev = $page->getRevision();
-			if ( $rev ) {
-				$revId = $rev->getId();
-			}
+		if ( !$store->countWatchers( $catPage ) ) {
+			# Nobody watches the category
+			return;
+		}
+
+		if ( ExtensionRegistry::getInstance()->getAllThings()['Echo'] ?? false ) {
+			$revisionLockup = $mwServices->getRevisionLookup();
+			$revision = $revisionLockup->getRevisionByTitle( $page );
+			$revId = $revision ? $revision->getId() : null;
+			# Send a notification!
 			EchoEvent::create( [
 				'type' => 'categorywatch-remove',
-				'title' => $cat->getTitle(),
-				'agent' => $user,
+				'title' => Title::castFromPageIdentity( $cat->getPage() ),
+				'agent' => $revision->getUser(),
 				'extra' => [
 					'pageid' => $page->getId(),
-					'revid' => $revId
+					'revid' => $revId,
 				],
 			] );
 		}
@@ -254,12 +185,12 @@ class Hook {
 	/**
 	 * Find the watchers for a title
 	 *
-	 * @param Title $target to check
+	 * @param PageIdentity $target to check
 	 *
-	 * @return array
+	 * @return User[]
 	 */
-	private static function getWatchers( Title $target ) {
-		$dbr = wfGetDB( DB_REPLICA );
+	private static function getWatchers( PageIdentity $target ): array {
+		$dbr = MediaWikiServices::getInstance()->getDBLoadBalancer()->getMaintenanceConnectionRef( DB_REPLICA );
 		$return = $dbr->selectFieldValues(
 			'watchlist',
 			'wl_user',
@@ -270,9 +201,16 @@ class Hook {
 			__METHOD__
 		);
 
-		return array_map( static function ( $userID ) {
-			return User::newFromID( $userID );
+		$userFactory = MediaWikiServices::getInstance()->getUserFactory();
+		$userOptionLookup = MediaWikiServices::getInstance()->getUserOptionsLookup();
+		$return = array_map( static function ( $userID ) use ( $userFactory, $userOptionLookup ) {
+			$user = $userFactory->newFromId( $userID );
+			if ( $userOptionLookup->getOption( $user, 'categorywatch-page-watch' ) ) {
+				return $user;
+			}
+			return null;
 		}, $return );
+		return array_filter( $return );
 	}
 
 	/**
@@ -281,8 +219,7 @@ class Hook {
 	 * @param EchoEvent $event to be looked at
 	 * @return array
 	 */
-	public static function userLocater( EchoEvent $event ) {
-		wfDebugLog( 'CategoryWatch', __METHOD__ );
+	public static function userLocater( EchoEvent $event ): array {
 		return self::getWatchers( $event->getTitle() );
 	}
 
@@ -292,8 +229,7 @@ class Hook {
 	 * @param EchoEvent $event to be looked at
 	 * @return array
 	 */
-	public static function userFilter( EchoEvent $event ) {
-		wfDebugLog( 'CategoryWatch', __METHOD__ );
+	public static function userFilter( EchoEvent $event ): array {
 		return [ $event->getAgent() ];
 	}
 }

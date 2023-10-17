@@ -26,6 +26,7 @@ namespace CategoryWatch;
 use MediaWiki\MediaWikiServices;
 use Message;
 use Title;
+use Wikimedia\Timestamp\TimestampException;
 use WikiPage;
 
 class EchoEventPresentationModel extends \EchoEventPresentationModel {
@@ -172,15 +173,14 @@ class EchoEventPresentationModel extends \EchoEventPresentationModel {
 	 * @return array
 	 * @throws TimestampException
 	 */
-	#[\ReturnTypeWillChange]
-	public function jsonSerialize() {
+	public function jsonSerialize(): array {
 		wfDebugLog( 'CategoryWatch', __METHOD__ );
 		$body = $this->getBodyMessage();
 
 		return [
 			'header' => $this->getHeaderMessage()->parse(),
 			'compactHeader' => $this->getCompactHeaderMessage()->parse(),
-			'body' => $body ? $body->toString() : '',
+			'body' => $body ? $body->toString( Message::FORMAT_PARSE ) : '',
 			'icon' => $this->getIconType(),
 			'links' => [
 				'primary' => $this->getPrimaryLinkWithMarkAsRead() ?: [],
